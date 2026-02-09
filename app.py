@@ -57,8 +57,8 @@ def _run_analysis(url: str):
           f"lang={page_data.has_lang_attr}  structured_data={page_data.has_structured_data}")
     progress.progress(25, text="🤖 Running AI agents in parallel…")
 
-    # Step 3 — Run agents in parallel
-    print(f"\n[Agents] Launching 5 agents in parallel…")
+    # Step 3 — Run agents (max 2 concurrent to avoid rate-limit bursts)
+    print(f"\n[Agents] Launching 5 agents (max 2 concurrent to respect rate limits)…")
     agents_start = time.time()
     agent_map = {
         "text": text_agent,
@@ -68,7 +68,7 @@ def _run_analysis(url: str):
         "tech": tech_agent,
     }
     results: dict = {}
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    with ThreadPoolExecutor(max_workers=2) as pool:
         futures = {
             pool.submit(mod.analyze, page_data, llm): key
             for key, mod in agent_map.items()
@@ -82,6 +82,9 @@ def _run_analysis(url: str):
             progress.progress(pct, text=f"✅ {results[key].agent_name} done")
 
     print(f"[Agents] ✓ All 5 agents finished in {time.time() - agents_start:.2f}s")
+    fallback_agents = [k for k, v in results.items() if "rule-based" in v.summary.lower()]
+    if fallback_agents:
+        print(f"[Agents] ⚠️  Fallback used for: {', '.join(fallback_agents)}")
 
     # Step 4 — Score
     progress.progress(90, text="📊 Calculating CEPS score…")
@@ -109,6 +112,7 @@ def _run_analysis(url: str):
     print(f"  Tech          : {results['tech'].score}")
     print(f"─" * 60)
     print(f"  LLM Calls     : {usage['total_calls']}")
+    print(f"  Retries (429) : {usage['total_retries']}")
     print(f"  Prompt Tokens : {usage['total_prompt_tokens']}")
     print(f"  Compl. Tokens : {usage['total_completion_tokens']}")
     print(f"  Total Tokens  : {usage['total_tokens']}")

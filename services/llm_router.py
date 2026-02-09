@@ -1,4 +1,4 @@
-"""LLM Routing Layer — wraps Google Gemini for text and vision calls."""
+"""LLM Routing Layer — wraps Google Gemini with retry, throttle, and token tracking."""
 
 import json
 import re
@@ -10,19 +10,78 @@ from io import BytesIO
 import requests
 from core.config import GEMINI_MODEL
 
+# Retry settings
+MAX_RETRIES = 4
+INITIAL_BACKOFF = 2        # seconds
+BACKOFF_MULTIPLIER = 2     # exponential
+MIN_CALL_DELAY = 1.0       # minimum seconds between API calls (throttle)
+
 
 class LLMRouter:
-    """Thin wrapper around Gemini that every agent uses."""
+    """Thin wrapper around Gemini with retry, throttle, and token tracking."""
 
     def __init__(self, api_key: str, model_name: str | None = None):
         genai.configure(api_key=api_key)
         self._model_name = model_name or GEMINI_MODEL
         self._model = genai.GenerativeModel(self._model_name)
         self._lock = threading.Lock()
+        self._last_call_time = 0.0
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.total_calls = 0
+        self.total_retries = 0
         print(f"[LLMRouter] Initialized with model: {self._model_name}")
+
+    # ── throttle / rate-limit guard ──────────────────────────────────
+    def _throttle(self):
+        """Ensure a minimum delay between consecutive API calls."""
+        with self._lock:
+            now = time.time()
+            elapsed = now - self._last_call_time
+            if elapsed < MIN_CALL_DELAY:
+                wait = MIN_CALL_DELAY - elapsed
+                print(f"[LLMRouter] ⏳ Throttling {wait:.1f}s…")
+                time.sleep(wait)
+            self._last_call_time = time.time()
+
+    # ── retry with exponential backoff ───────────────────────────────
+    def _call_with_retry(self, content, label: str):
+        """Call generate_content with retry on 429 / rate-limit errors."""
+        backoff = INITIAL_BACKOFF
+        last_err = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            self._throttle()
+            try:
+                start = time.time()
+                response = self._model.generate_content(content)
+                elapsed = round(time.time() - start, 2)
+                self._track_usage(response, label)
+                print(f"[LLMRouter] << Response ({label}) in {elapsed}s")
+                return response
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                is_rate_limit = (
+                    "429" in err_str
+                    or "quota" in err_str.lower()
+                    or "rate" in err_str.lower()
+                    or "resource" in err_str.lower()
+                    or "ResourceExhausted" in type(e).__name__
+                )
+                if is_rate_limit and attempt < MAX_RETRIES:
+                    with self._lock:
+                        self.total_retries += 1
+                    print(
+                        f"[LLMRouter] ⚠️  Rate-limited ({label}), "
+                        f"retry {attempt}/{MAX_RETRIES} in {backoff}s…"
+                    )
+                    time.sleep(backoff)
+                    backoff *= BACKOFF_MULTIPLIER
+                else:
+                    raise
+
+        raise last_err  # type: ignore[misc]
 
     # ── token tracking ───────────────────────────────────────────────
     def _track_usage(self, response, label: str):
@@ -54,6 +113,7 @@ class LLMRouter:
         with self._lock:
             return {
                 "total_calls": self.total_calls,
+                "total_retries": self.total_retries,
                 "total_prompt_tokens": self.total_prompt_tokens,
                 "total_completion_tokens": self.total_completion_tokens,
                 "total_tokens": self.total_prompt_tokens + self.total_completion_tokens,
@@ -62,12 +122,8 @@ class LLMRouter:
     # ── public helpers ──────────────────────────────────────────────
     def analyze_text(self, prompt: str, label: str = "text") -> str:
         """Send a text-only prompt and return the raw response text."""
-        start = time.time()
         print(f"[LLMRouter] >> Sending text request ({label})…")
-        response = self._model.generate_content(prompt)
-        elapsed = round(time.time() - start, 2)
-        self._track_usage(response, label)
-        print(f"[LLMRouter] << Response received ({label}) in {elapsed}s")
+        response = self._call_with_retry(prompt, label)
         return response.text
 
     def analyze_image(self, image_url: str, prompt: str, label: str = "vision") -> str:
@@ -76,12 +132,8 @@ class LLMRouter:
         if img is None:
             print(f"[LLMRouter] !! Failed to download image: {image_url}")
             return '{"error": "Could not download image"}'
-        start = time.time()
         print(f"[LLMRouter] >> Sending image+text request ({label})…")
-        response = self._model.generate_content([prompt, img])
-        elapsed = round(time.time() - start, 2)
-        self._track_usage(response, label)
-        print(f"[LLMRouter] << Response received ({label}) in {elapsed}s")
+        response = self._call_with_retry([prompt, img], label)
         return response.text
 
     def analyze_images_batch(self, image_urls: list[str], prompt: str, label: str = "vision-batch") -> str:
@@ -97,12 +149,8 @@ class LLMRouter:
         if len(parts) == 1:
             print(f"[LLMRouter] !! No images could be downloaded for batch")
             return '{"error": "No images could be downloaded"}'
-        start = time.time()
         print(f"[LLMRouter] >> Sending {len(parts)-1} image(s) + text request ({label})…")
-        response = self._model.generate_content(parts)
-        elapsed = round(time.time() - start, 2)
-        self._track_usage(response, label)
-        print(f"[LLMRouter] << Response received ({label}) in {elapsed}s")
+        response = self._call_with_retry(parts, label)
         return response.text
 
     # ── JSON extraction ─────────────────────────────────────────────

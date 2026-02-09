@@ -29,12 +29,69 @@ Evaluate:
 6. Structured data for search credibility
 7. Any red-flag patterns (e.g. excessive forms, no legal pages)
 
+IMPORTANT RULES:
+- Base your evaluation ONLY on the data provided above.
+- Every finding MUST reference a specific value (e.g. "SSL is True", "0 social links found").
+- Do NOT speculate about content, design, or anything not in the data.
+- If a field is True, treat it as a positive signal. If False, treat it as a gap.
+
 Return ONLY this JSON:
 {{
   "score": <integer 0-100>,
   "findings": ["<finding 1>", ...],
   "summary": "<one-sentence assessment>"
 }}"""
+
+
+def _fallback(page_data: PageData) -> AgentResult:
+    """Rule-based trust scoring when LLM is unavailable."""
+    score = 20
+    findings = []
+
+    if page_data.has_ssl:
+        score += 20
+        findings.append("HTTPS / SSL enabled ✓")
+    else:
+        findings.append("No HTTPS — major trust concern")
+
+    if page_data.has_privacy_policy:
+        score += 15
+        findings.append("Privacy policy detected ✓")
+    else:
+        findings.append("No privacy policy found")
+
+    if page_data.has_contact_info:
+        score += 15
+        findings.append("Contact information detected ✓")
+    else:
+        findings.append("No contact information found")
+
+    social_count = len(page_data.social_links)
+    if social_count >= 2:
+        score += 10
+        findings.append(f"{social_count} social media links — good legitimacy signal")
+    elif social_count == 1:
+        score += 5
+        findings.append("1 social media link found")
+    else:
+        findings.append("No social media links")
+
+    if page_data.has_structured_data:
+        score += 10
+        findings.append("Structured data (schema.org) present ✓")
+
+    if page_data.title and page_data.meta_description:
+        score += 5
+        findings.append("Professional title and meta description present")
+
+    score = max(0, min(100, score))
+    print(f"[TrustAgent] Fallback score={score} (rule-based, LLM unavailable)")
+    return AgentResult(
+        agent_name=AGENT_NAME,
+        score=float(score),
+        findings=findings,
+        summary=f"Rule-based analysis: SSL={'yes' if page_data.has_ssl else 'no'}, privacy={'yes' if page_data.has_privacy_policy else 'no'}, contact={'yes' if page_data.has_contact_info else 'no'}.",
+    )
 
 
 def analyze(page_data: PageData, llm: LLMRouter) -> AgentResult:
@@ -55,21 +112,17 @@ def analyze(page_data: PageData, llm: LLMRouter) -> AgentResult:
     try:
         raw = llm.analyze_text(prompt, label="trust-agent")
         data = llm.parse_json(raw)
-        if data:
-            print(f"[TrustAgent] ✓ Completed — score={data.get('score')}")
+        if data and "score" in data:
+            print(f"[TrustAgent] ✓ Completed — score={data['score']}")
             return AgentResult(
                 agent_name=AGENT_NAME,
-                score=float(data.get("score", 50)),
+                score=float(data["score"]),
                 findings=data.get("findings", []),
                 summary=data.get("summary", ""),
             )
+        else:
+            print("[TrustAgent] ⚠️ LLM returned unparseable response, using fallback")
+            return _fallback(page_data)
     except Exception as e:
-        print(f"[TrustAgent] !! Error: {e}")
-        return AgentResult(
-            agent_name=AGENT_NAME,
-            score=50,
-            findings=[f"Analysis error: {e}"],
-            summary="Could not complete trust analysis.",
-        )
-    print("[TrustAgent] ✓ Completed")
-    return AgentResult(agent_name=AGENT_NAME)
+        print(f"[TrustAgent] ⚠️ LLM error ({type(e).__name__}), using fallback")
+        return _fallback(page_data)
